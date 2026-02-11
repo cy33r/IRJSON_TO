@@ -1,201 +1,301 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 import json
 import urllib.parse
+import urllib.request
+import ssl
 import base64
+import threading
+import traceback
+import sys
 
 # --- Logic Functions ---
 
-def generate_link():
-    json_input = text_input.get("1.0", tk.END).strip()
-    
-    if not json_input:
-        messagebox.showwarning("Warning", "Please paste the JSON config first!")
-        return
-
+def generate_vless_vmess_url(outbound, remark_base, index):
     try:
-        data = json.loads(json_input)
-    except json.JSONDecodeError:
-        messagebox.showerror("Error", "Invalid JSON format!")
-        return
+        protocol = outbound.get("protocol")
+        if not protocol: return None
 
-    # Get Remark
-    remark = data.get("remarks", "VIP3R-Config")
-    safe_remark = urllib.parse.quote(remark)
-
-    # Find relevant outbound
-    target_outbound = None
-    protocol = ""
-    
-    if "outbounds" in data:
-        for outbound in data["outbounds"]:
-            proto = outbound.get("protocol")
-            if proto in ["vless", "vmess", "trojan"]:
-                target_outbound = outbound
-                protocol = proto
-                break
-    
-    if not target_outbound:
-        messagebox.showerror("Error", "No VLESS, VMess, or Trojan outbound found.")
-        return
-
-    try:
-        # Common settings
-        settings = target_outbound["settings"]
-        stream_settings = target_outbound.get("streamSettings", {})
+        settings = outbound.get("settings", {})
+        stream_settings = outbound.get("streamSettings", {})
         network = stream_settings.get("network", "tcp")
         security = stream_settings.get("security", "none")
         
-        # Extract Server Info
-        if protocol in ["vless", "trojan"]:
-            vnext = settings.get("vnext", [{}])[0] if "vnext" in settings else settings.get("servers", [{}])[0]
-            address = vnext.get("address")
-            port = vnext.get("port")
-            
-            if protocol == "vless":
-                uuid_pass = vnext["users"][0]["id"]
-            else: # trojan
-                uuid_pass = vnext.get("password", [""])[0]
+        tag = outbound.get("tag", "")
+        if tag and tag != "proxy":
+             final_name = f"{remark_base}-{tag}"
+        else:
+             final_name = remark_base
+             
+        safe_remark = urllib.parse.quote(final_name)
 
-            # Build Params
+        address = ""
+        port = 0
+        uuid_pass = ""
+
+        # VLESS / TROJAN
+        if protocol in ["vless", "trojan"]:
+            if "vnext" in settings and settings["vnext"]:
+                target = settings["vnext"][0]
+                address = target.get("address", "")
+                port = target.get("port", 0)
+                if protocol == "vless" and target.get("users"):
+                    uuid_pass = target["users"][0].get("id", "")
+                elif protocol == "trojan":
+                     pws = target.get("password", [])
+                     if isinstance(pws, list) and pws: uuid_pass = pws[0]
+                     elif isinstance(pws, str): uuid_pass = pws
+
+            elif "servers" in settings and settings["servers"]:
+                target = settings["servers"][0]
+                address = target.get("address", "")
+                port = target.get("port", 0)
+                if protocol == "trojan":
+                    uuid_pass = target.get("password", "")
+            
+            if not address or not uuid_pass:
+                return None
+
             params = {"type": network, "security": security}
             
-            # WS / GRPC / TCP Headers
             if network == "ws":
-                ws_settings = stream_settings.get("wsSettings", {})
-                if "path" in ws_settings: params["path"] = ws_settings["path"]
-                if "headers" in ws_settings and "Host" in ws_settings["headers"]:
-                    params["host"] = ws_settings["headers"]["Host"]
-                elif "host" in ws_settings: params["host"] = ws_settings["host"]
+                ws = stream_settings.get("wsSettings", {})
+                if "path" in ws: params["path"] = ws["path"]
+                headers = ws.get("headers", {})
+                if "Host" in headers: params["host"] = headers["Host"]
+                elif "host" in ws: params["host"] = ws["host"]
             
             elif network == "grpc":
-                grpc_settings = stream_settings.get("grpcSettings", {})
-                if "serviceName" in grpc_settings: params["serviceName"] = grpc_settings["serviceName"]
-                if "mode" in grpc_settings: params["mode"] = grpc_settings["mode"]
+                grpc = stream_settings.get("grpcSettings", {})
+                if "serviceName" in grpc: params["serviceName"] = grpc["serviceName"]
+                if "mode" in grpc: params["mode"] = grpc["mode"]
 
-            # TLS / Reality
             if security in ["tls", "xtls", "reality"]:
-                tls_settings = stream_settings.get("tlsSettings") or stream_settings.get("xtlsSettings") or stream_settings.get("realitySettings") or {}
-                if "serverName" in tls_settings: params["sni"] = tls_settings["serverName"]
+                tls = stream_settings.get("tlsSettings") or stream_settings.get("xtlsSettings") or stream_settings.get("realitySettings") or {}
+                if "serverName" in tls: params["sni"] = tls["serverName"]
+                if "alpn" in tls and tls["alpn"]: params["alpn"] = ",".join(tls["alpn"])
+                
                 if security == "reality":
-                    if "publicKey" in tls_settings: params["pbk"] = tls_settings["publicKey"]
-                    if "shortIds" in tls_settings: params["sid"] = tls_settings["shortIds"][0]
-                    if "fingerprint" in tls_settings: params["fp"] = tls_settings["fingerprint"]
-                elif "alpn" in tls_settings:
-                    params["alpn"] = ",".join(tls_settings["alpn"])
+                    if "publicKey" in tls: params["pbk"] = tls["publicKey"]
+                    if "shortIds" in tls: params["sid"] = tls["shortIds"][0]
+                    if "fingerprint" in tls: params["fp"] = tls["fingerprint"]
+                    if "spiderX" in tls: params["spx"] = tls["spiderX"]
 
             query = urllib.parse.urlencode(params)
-            final_link = f"{protocol}://{uuid_pass}@{address}:{port}?{query}#{safe_remark}"
+            return f"{protocol}://{uuid_pass}@{address}:{port}?{query}#{safe_remark}"
 
+        # --- VMESS ---
         elif protocol == "vmess":
-            # VMess uses Base64 encoded JSON
-            vnext = settings["vnext"][0]
-            address = vnext["address"]
-            port = vnext["port"]
-            uuid = vnext["users"][0]["id"]
-            alterId = vnext["users"][0].get("alterId", 0)
+            if "vnext" in settings and settings["vnext"]:
+                target = settings["vnext"][0]
+                address = target.get("address", "")
+                port = target.get("port", 0)
+                users = target.get("users", [{}])
+                uuid = users[0].get("id", "")
+                alterId = users[0].get("alterId", 0)
 
-            vmess_dict = {
-                "v": "2",
-                "ps": remark,
-                "add": address,
-                "port": port,
-                "id": uuid,
-                "aid": alterId,
-                "net": network,
-                "type": "none",
-                "host": "",
-                "path": "",
-                "tls": security if security != "none" else ""
-            }
+                vmess_dict = {
+                    "v": "2", "ps": urllib.parse.unquote(safe_remark), 
+                    "add": address, "port": port, "id": uuid, "aid": alterId,
+                    "net": network, "type": "none", "host": "", "path": "", 
+                    "tls": security if security != "none" else ""
+                }
 
-            # Fill specific network details
-            if network == "ws":
-                ws_settings = stream_settings.get("wsSettings", {})
-                vmess_dict["path"] = ws_settings.get("path", "")
-                headers = ws_settings.get("headers", {})
-                vmess_dict["host"] = headers.get("Host", ws_settings.get("host", ""))
+                if network == "ws":
+                    ws = stream_settings.get("wsSettings", {})
+                    vmess_dict["path"] = ws.get("path", "")
+                    headers = ws.get("headers", {})
+                    vmess_dict["host"] = headers.get("Host", ws.get("host", ""))
+                elif network == "grpc":
+                    grpc = stream_settings.get("grpcSettings", {})
+                    vmess_dict["path"] = grpc.get("serviceName", "")
+                    vmess_dict["type"] = grpc.get("mode", "gun")
+
+                if security in ["tls", "reality"]:
+                    tls = stream_settings.get("tlsSettings") or stream_settings.get("realitySettings") or {}
+                    vmess_dict["sni"] = tls.get("serverName", "")
+
+                b64 = base64.b64encode(json.dumps(vmess_dict).encode()).decode()
+                return f"vmess://{b64}"
+
+    except Exception:
+        return None
+    return None
+
+def process_single_item(item, index, default_remark="VIP3R"):
+    extracted_links = []
+    local_remark = item.get("remarks", default_remark)
+    
+    if "outbounds" in item and isinstance(item["outbounds"], list):
+        for sub_outbound in item["outbounds"]:
+            if sub_outbound.get("protocol") in ["vless", "vmess", "trojan"]:
+                link = generate_vless_vmess_url(sub_outbound, local_remark, index)
+                if link: extracted_links.append(link)
+    
+    elif "protocol" in item:
+        if item.get("protocol") in ["vless", "vmess", "trojan"]:
+            link = generate_vless_vmess_url(item, local_remark, index)
+            if link: extracted_links.append(link)
             
-            elif network == "grpc":
-                 grpc_settings = stream_settings.get("grpcSettings", {})
-                 vmess_dict["path"] = grpc_settings.get("serviceName", "")
-                 vmess_dict["type"] = grpc_settings.get("mode", "gun")
+    return extracted_links
 
-            if security in ["tls", "reality"]:
-                 tls_settings = stream_settings.get("tlsSettings") or stream_settings.get("realitySettings") or {}
-                 vmess_dict["sni"] = tls_settings.get("serverName", "")
+def processing_thread(content):
+    try:
+        print("--- STARTING PROCESSING ---")
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            print("Invalid JSON structure")
+            update_status("ERROR: INVALID JSON STRUCTURE", "red")
+            messagebox.showerror("ERROR", "INVALID JSON FORMAT!")
+            return
 
-            # Encode
-            json_str = json.dumps(vmess_dict)
-            b64_str = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
-            final_link = f"vmess://{b64_str}"
+        items_to_process = []
+        if isinstance(data, dict):
+            items_to_process = [data]
+        elif isinstance(data, list):
+            items_to_process = data
+        else:
+            print("Unknown Data Type")
+            return
 
-        # Output result
-        entry_output.config(state='normal', bg="white", fg="black") # Changed colors here
-        entry_output.delete(0, tk.END)
-        entry_output.insert(0, final_link)
-        entry_output.config(state='readonly')
-        status_label.config(text=f"Converted to {protocol.upper()}!", fg="#00ff00")
+        final_links = []
+        for i, item in enumerate(items_to_process):
+            if isinstance(item, dict):
+                links = process_single_item(item, i)
+                final_links.extend(links)
+        
+        if not final_links:
+            update_status("NO CONFIGS FOUND", "red")
+            messagebox.showwarning("RESULT", "NO VALID CONFIGS FOUND.")
+            return
+
+        result_text = "\n".join(final_links)
+        root.after(0, lambda: display_result(result_text, len(final_links)))
+        print(f"Successfully extracted {len(final_links)} links.")
 
     except Exception as e:
-        messagebox.showerror("Error", f"Parsing Error: {str(e)}")
+        print("CRITICAL ERROR IN THREAD:")
+        traceback.print_exc()
+        update_status(f"ERROR: {str(e).upper()}", "red")
+
+def display_result(text, count):
+    entry_output.config(state='normal', bg="white", fg="black")
+    entry_output.delete("1.0", tk.END)
+    entry_output.insert("1.0", text)
+    entry_output.config(state='disabled')
+    status_label.config(text=f"SUCCESS! {count} CONFIGS EXTRACTED.", fg="#00ff00")
+
+def update_status(text, color):
+    root.after(0, lambda: status_label.config(text=text, fg=color))
+
+# --- Button Actions ---
+
+def on_convert_click():
+    content = text_input.get("1.0", tk.END).strip()
+    if not content:
+        messagebox.showwarning("WARNING", "PLEASE PASTE JSON FIRST!")
+        return
+    
+    status_label.config(text="PROCESSING...", fg="yellow")
+    threading.Thread(target=processing_thread, args=(content,), daemon=True).start()
+
+def fetch_from_url_thread(url):
+    try:
+        print(f"Downloading from: {url}")
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+            content = response.read().decode('utf-8', errors='ignore')
+        
+        print("Download complete.")
+        root.after(0, lambda: text_input.delete("1.0", tk.END))
+        root.after(0, lambda: text_input.insert("1.0", content))
+        
+        processing_thread(content)
+        
+    except Exception as e:
+        print("DOWNLOAD ERROR:")
+        traceback.print_exc()
+        update_status("DOWNLOAD FAILED", "red")
+        root.after(0, lambda: messagebox.showerror("DOWNLOAD ERROR", f"CHECK CMD FOR DETAILS.\n{str(e)}"))
+
+def on_url_click():
+    url = simpledialog.askstring("IMPORT URL", "ENTER SUBSCRIPTION/FILE URL:")
+    if not url: return
+    status_label.config(text="DOWNLOADING...", fg="yellow")
+    threading.Thread(target=fetch_from_url_thread, args=(url,), daemon=True).start()
+
+def clear_all():
+    text_input.delete("1.0", tk.END)
+    entry_output.config(state='normal', bg="white")
+    entry_output.delete("1.0", tk.END)
+    entry_output.config(state='disabled')
+    status_label.config(text="CLEARED.", fg="white")
 
 def copy_to_clipboard():
-    link = entry_output.get()
+    link = entry_output.get("1.0", tk.END).strip()
     if link:
         root.clipboard_clear()
         root.clipboard_append(link)
-        status_label.config(text="Link Copied to Clipboard!", fg="#00ffff")
-    else:
-        status_label.config(text="Nothing to copy.", fg="red")
+        status_label.config(text="ALL LINKS COPIED!", fg="#00ffff")
 
 # --- GUI Setup ---
 
-root = tk.Tk()
-root.title("IRJSON_TO")
-root.geometry("500x600")
-root.configure(bg="#1e1e1e")
-root.resizable(False, False)
+if __name__ == "__main__":
+    print("-" * 50)
+    print("VIP3R CONVERTER STARTED")
+    print("LOGS WILL APPEAR HERE...")
+    print("-" * 50)
 
-# Styles
-BG_COLOR = "#1e1e1e"
-FG_COLOR = "#ffffff"
-ACCENT_COLOR = "#00ff00" # Hacker Green
-BUTTON_COLOR = "#333333"
+    root = tk.Tk()
+    root.title("IRJSON_TO")
+    root.geometry("500x700")
+    root.configure(bg="#1e1e1e")
+    root.resizable(False, False)
 
-# Header
-lbl_header = tk.Label(root, text="V I P 3 R", font=("Consolas", 24, "bold"), bg=BG_COLOR, fg=ACCENT_COLOR)
-lbl_header.pack(pady=(20, 10))
+    BG = "#1e1e1e"
+    FG = "#ffffff"
+    ACCENT = "#00ff00" 
 
-# Input Section
-lbl_input = tk.Label(root, text="PASTE JSON CONFIG BELOW:", font=("Arial", 10, "bold"), bg=BG_COLOR, fg="#cccccc")
-lbl_input.pack(pady=5)
+    # Header
+    tk.Label(root, text="V I P 3 R", font=("Consolas", 24, "bold"), bg=BG, fg=ACCENT).pack(pady=(20, 5))
+    tk.Label(root, text="IRJSON_TO (ADVANCED VERSION)", font=("Arial", 10), bg=BG, fg="#666666").pack(pady=(0, 15))
 
-text_input = tk.Text(root, height=15, bg="#2d2d2d", fg=FG_COLOR, borderwidth=0, font=("Consolas", 9))
-text_input.pack(padx=20, pady=5, fill=tk.X)
+    # Top Buttons Frame
+    frame_top_btns = tk.Frame(root, bg=BG)
+    frame_top_btns.pack(fill=tk.X, padx=20)
 
-# Convert Button
-btn_convert = tk.Button(root, text="CONVERT TO LINK", command=generate_link, 
-                        font=("Arial", 12, "bold"), bg=ACCENT_COLOR, fg="black", 
-                        relief="flat", pady=5, cursor="hand2")
-btn_convert.pack(pady=20, fill=tk.X, padx=50)
+    btn_url = tk.Button(frame_top_btns, text="🌐 IMPORT URL", command=on_url_click, 
+                        font=("Arial", 9, "bold"), bg="#007acc", fg="white", relief="flat", width=20)
+    btn_url.pack(side=tk.LEFT, padx=5)
 
-# Output Section
-lbl_output = tk.Label(root, text="NORMAL LINK (VLESS/VMESS/TROJAN):", font=("Arial", 10, "bold"), bg=BG_COLOR, fg="#cccccc")
-lbl_output.pack(pady=5)
+    btn_clear = tk.Button(frame_top_btns, text="🗑 CLEAR", command=clear_all, 
+                          font=("Arial", 9, "bold"), bg="#ff4444", fg="white", relief="flat", width=20)
+    btn_clear.pack(side=tk.RIGHT, padx=5)
 
-# CHANGED HERE: bg="white", fg="black" for readability
-entry_output = tk.Entry(root, bg="white", fg="black", borderwidth=0, font=("Consolas", 10), state='readonly')
-entry_output.pack(padx=20, pady=5, fill=tk.X, ipady=5)
+    # Input
+    tk.Label(root, text="PASTE JSON CONFIG BELOW:", font=("Arial", 9, "bold"), bg=BG, fg="#cccccc").pack(pady=(10, 5))
+    text_input = tk.Text(root, height=10, bg="#2d2d2d", fg=FG, borderwidth=0, font=("Consolas", 9))
+    text_input.pack(padx=20, fill=tk.X)
 
-# Copy Button
-btn_copy = tk.Button(root, text="COPY LINK", command=copy_to_clipboard, 
-                     font=("Arial", 10), bg=BUTTON_COLOR, fg="white", 
-                     relief="flat", cursor="hand2")
-btn_copy.pack(pady=10)
+    # Convert
+    tk.Button(root, text="CONVERT TO LINKS", command=on_convert_click, 
+              font=("Arial", 11, "bold"), bg=ACCENT, fg="black", relief="flat", pady=5).pack(pady=15, fill=tk.X, padx=50)
 
-# Status Bar
-status_label = tk.Label(root, text="Ready", bg=BG_COLOR, fg="#666666", font=("Arial", 8))
-status_label.pack(side=tk.BOTTOM, pady=10)
+    # Output
+    tk.Label(root, text="NORMAL LINKS (BATCH RESULT):", font=("Arial", 9, "bold"), bg=BG, fg="#cccccc").pack(pady=5)
+    entry_output = tk.Text(root, height=10, bg="white", fg="black", borderwidth=0, font=("Consolas", 9), state='disabled')
+    entry_output.pack(padx=20, fill=tk.X)
 
-root.mainloop()
+    # Copy
+    tk.Button(root, text="COPY ALL LINKS", command=copy_to_clipboard, 
+              font=("Arial", 10), bg="#333333", fg="white", relief="flat").pack(pady=10)
+
+    status_label = tk.Label(root, text="READY", bg=BG, fg="#666666", font=("Arial", 8))
+    status_label.pack(side=tk.BOTTOM, pady=10)
+
+    root.mainloop()
